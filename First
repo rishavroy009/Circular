@@ -1,140 +1,143 @@
 #include <iostream>
 #include <fstream>
-#include <cstring>
-#include <fcntl.h> 
 #include <sys/mman.h>
 #include <unistd.h>
-#include <semaphore.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <string>
+#include <queue>
 
-#define SHM_NAME "/my_shared_memory"
-#define QUEUE_SIZE 1048576 // 1MB buffer for the circular queue
-#define SHM_SIZE (sizeof(CircularQueue)) // Size for the shared memory segment
+using namespace std;
 
-struct CircularQueue {
-    size_t head;
-    size_t tail;
-    size_t size;
-    char buffer[QUEUE_SIZE];
-};
+// Shared memory file name
+const char* SHM_FILE = "/tmp/shared_memory";
+// Size of shared memory
+const size_t SHM_SIZE = 10 * 1024 * 1024; // 10 MB
 
-bool isFull(CircularQueue* queue) {
-    return ((queue->head + 1) % queue->size) == queue->tail;
-}
-
-bool isEmpty(CircularQueue* queue) {
-    return queue->head == queue->tail;
-}
-
-void enqueue(CircularQueue* queue, char data) {
-    if (!isFull(queue)) {
-        queue->buffer[queue->head] = data;
-        queue->head = (queue->head + 1) % queue->size;
-    }
-}
-
-char dequeue(CircularQueue* queue) {
-    if (!isEmpty(queue)) {
-        char data = queue->buffer[queue->tail];
-        queue->tail = (queue->tail + 1) % queue->size;
-        return data;
-    }
-    return '\0';
-}
-
-void producer(const char* input_file) {
-    int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+// Function to create shared memory
+int create_shared_memory() {
+    // Create a shared memory file
+    int shm_fd = shm_open(SHM_FILE, O_CREAT | O_RDWR, 0666);
     if (shm_fd == -1) {
         perror("shm_open");
-        exit(EXIT_FAILURE);
+        return -1;
     }
 
+    // Set the size of the shared memory
     if (ftruncate(shm_fd, SHM_SIZE) == -1) {
         perror("ftruncate");
-        exit(EXIT_FAILURE);
+        return -1;
     }
 
-    CircularQueue* queue = (CircularQueue*) mmap(0, SHM_SIZE, PROT_WRITE, MAP_SHARED, shm_fd, 0);
-    if (queue == MAP_FAILED) {
-        perror("mmap");
-        exit(EXIT_FAILURE);
-    }
-
-    queue->head = 0;
-    queue->tail = 0;
-    queue->size = QUEUE_SIZE;
-
-    std::ifstream infile(input_file, std::ios::binary);
-    if (!infile.is_open()) {
-        perror("ifstream");
-        exit(EXIT_FAILURE);
-    }
-
-    char ch;
-    while (infile.get(ch)) {
-        while (isFull(queue)) {
-            // Busy wait or use semaphore
-        }
-        enqueue(queue, ch);
-    }
-
-    infile.close();
-    munmap(queue, SHM_SIZE);
-    close(shm_fd);
+    return shm_fd;
 }
 
-void consumer(const char* output_file) {
-    int shm_fd = shm_open(SHM_NAME, O_RDONLY, 0666);
+// Function to map shared memory
+void* map_shared_memory(int shm_fd) {
+    // Map shared memory into process address space
+    void* shm_ptr = mmap(NULL, SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (shm_ptr == MAP_FAILED) {
+        perror("mmap");
+        return NULL;
+    }
+
+    return shm_ptr;
+}
+
+// Function to unmap shared memory
+void unmap_shared_memory(void* shm_ptr) {
+    if (munmap(shm_ptr, SHM_SIZE) == -1) {
+        perror("munmap");
+    }
+}
+
+// Function to close shared memory file descriptor
+void close_shared_memory(int shm_fd) {
+    if (close(shm_fd) == -1) {
+        perror("close");
+    }
+}
+
+// Function to remove shared memory file
+void remove_shared_memory() {
+    if (shm_unlink(SHM_FILE) == -1) {
+        perror("shm_unlink");
+    }
+}
+
+int main() {
+    // Create shared memory
+    int shm_fd = create_shared_memory();
+    if (shm_fd == -1) {
+        return 1;
+    }
+
+    // Map shared memory
+    void* shm_ptr = map_shared_memory(shm_fd);
+    if (shm_ptr == NULL) {
+        close_shared_memory(shm_fd);
+        return 1;
+    }
+
+    // Producer process
+    // Read data from the file and write it to shared memory
+    ifstream file("input.txt");
+    if (file.is_open()) {
+        // Read data from the file in chunks of 1024 bytes
+        char buffer[1024];
+        char* shm_buffer = (char*)shm_ptr;
+        while (file.read(buffer, 1024)) {
+            memcpy(shm_buffer, buffer, 1024);
+            shm_buffer += 1024;
+        }
+        file.close();
+    } else {
+        cout << "Unable to open file" << endl;
+        return 1;
+    }
+
+    // Unmap shared memory
+    unmap_shared_memory(shm_ptr);
+
+    // Close shared memory file descriptor
+    close_shared_memory(shm_fd);
+
+    // Consumer process
+    // Read data from shared memory and write it to a file
+    shm_fd = shm_open(SHM_FILE, O_RDONLY, 0666);
     if (shm_fd == -1) {
         perror("shm_open");
-        exit(EXIT_FAILURE);
+        return 1;
     }
 
-    CircularQueue* queue = (CircularQueue*) mmap(0, SHM_SIZE, PROT_READ, MAP_SHARED, shm_fd, 0);
-    if (queue == MAP_FAILED) {
-        perror("mmap");
-        exit(EXIT_FAILURE);
+    shm_ptr = map_shared_memory(shm_fd);
+    if (shm_ptr == NULL) {
+        close_shared_memory(shm_fd);
+        return 1;
     }
 
-    std::ofstream outfile(output_file, std::ios::binary);
-    if (!outfile.is_open()) {
-        perror("ofstream");
-        exit(EXIT_FAILURE);
-    }
-
-    while (true) {
-        while (isEmpty(queue)) {
-            // Busy wait or use semaphore
+    ofstream output_file("output.txt");
+    if (output_file.is_open()) {
+        // Read data from shared memory
+        char* shm_buffer = (char*)shm_ptr;
+        for (size_t i = 0; i < SHM_SIZE; i++) {
+            output_file << *shm_buffer;
+            shm_buffer++;
         }
-        char ch = dequeue(queue);
-        outfile.put(ch);
-        if (queue->head == queue->tail) break;
-    }
-
-    outfile.close();
-    munmap(queue, SHM_SIZE);
-    close(shm_fd);
-    shm_unlink(SHM_NAME);
-}
-
-int main(int argc, char* argv[]) {
-    if (argc != 4) {
-        std::cerr << "Usage: " << argv[0] << " <producer|consumer> <input_file> <output_file>" << std::endl;
-        return 1;
-    }
-
-    std::string role = argv[1];
-    const char* input_file = argv[2];
-    const char* output_file = argv[3];
-
-    if (role == "producer") {
-        producer(input_file);
-    } else if (role == "consumer") {
-        consumer(output_file);
+        output_file.close();
     } else {
-        std::cerr << "Unknown role: " << role << std::endl;
+        cout << "Unable to open file" << endl;
         return 1;
     }
+
+    // Unmap shared memory
+    unmap_shared_memory(shm_ptr);
+
+    // Close shared memory file descriptor
+    close_shared_memory(shm_fd);
+
+    // Remove shared memory file
+    remove_shared_memory();
 
     return 0;
 }
