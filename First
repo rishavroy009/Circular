@@ -1,151 +1,138 @@
 #include <iostream>
 #include <fstream>
 #include <cstring>
+#include <fcntl.h> 
 #include <sys/mman.h>
-#include <fcntl.h>
 #include <unistd.h>
+#include <semaphore.h>
+#include <sys/stat.h>
 
-#define SHARED_MEMORY_NAME "/shared_memory"
-#define QUEUE_SIZE 1024  // Buffer size for reading and writing
-#define MAX_DATA_SIZE 1024 * 1024 * 10  // 10 MB
+#define SHM_NAME "/my_shared_memory"
+#define QUEUE_SIZE 1048576 // 1MB buffer for the circular queue
+#define SHM_SIZE (sizeof(CircularQueue)) // Size for the shared memory segment
 
 struct CircularQueue {
-    char data[MAX_DATA_SIZE];
-    int head;
-    int tail;
-    int size;
+    size_t head;
+    size_t tail;
+    size_t size;
+    char buffer[QUEUE_SIZE];
 };
 
-void initQueue(CircularQueue* queue) {
+bool isFull(CircularQueue* queue) {
+    return ((queue->head + 1) % queue->size) == queue->tail;
+}
+
+bool isEmpty(CircularQueue* queue) {
+    return queue->head == queue->tail;
+}
+
+void enqueue(CircularQueue* queue, char data) {
+    if (!isFull(queue)) {
+        queue->buffer[queue->head] = data;
+        queue->head = (queue->head + 1) % queue->size;
+    }
+}
+
+char dequeue(CircularQueue* queue) {
+    if (!isEmpty(queue)) {
+        char data = queue->buffer[queue->tail];
+        queue->tail = (queue->tail + 1) % queue->size;
+        return data;
+    }
+    return '\0';
+}
+
+void producer(const char* input_file) {
+    int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+    if (shm_fd == -1) {
+        perror("shm_open");
+        exit(EXIT_FAILURE);
+    }
+
+    if (ftruncate(shm_fd, SHM_SIZE) == -1) {
+        perror("ftruncate");
+        exit(EXIT_FAILURE);
+    }
+
+    CircularQueue* queue = (CircularQueue*) mmap(0, SHM_SIZE, PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (queue == MAP_FAILED) {
+        perror("mmap");
+        exit(EXIT_FAILURE);
+    }
+
     queue->head = 0;
     queue->tail = 0;
-    queue->size = 0;
-}
+    queue->size = QUEUE_SIZE;
 
-bool isQueueFull(CircularQueue* queue) {
-    return queue->size == MAX_DATA_SIZE;
-}
-
-bool isQueueEmpty(CircularQueue* queue) {
-    return queue->size == 0;
-}
-
-void enqueue(CircularQueue* queue, const char* buffer, int size) {
-    int remainingSpace = MAX_DATA_SIZE - queue->size;
-    int writeSize = (size < remainingSpace) ? size : remainingSpace;
-    int firstChunk = (queue->tail + writeSize <= MAX_DATA_SIZE) ? writeSize : MAX_DATA_SIZE - queue->tail;
-    int secondChunk = writeSize - firstChunk;
-
-    memcpy(queue->data + queue->tail, buffer, firstChunk);
-    if (secondChunk > 0) {
-        memcpy(queue->data, buffer + firstChunk, secondChunk);
-    }
-    queue->tail = (queue->tail + writeSize) % MAX_DATA_SIZE;
-    queue->size += writeSize;
-}
-
-int dequeue(CircularQueue* queue, char* buffer, int size) {
-    int availableData = queue->size;
-    int readSize = (size < availableData) ? size : availableData;
-    int firstChunk = (queue->head + readSize <= MAX_DATA_SIZE) ? readSize : MAX_DATA_SIZE - queue->head;
-    int secondChunk = readSize - firstChunk;
-
-    memcpy(buffer, queue->data + queue->head, firstChunk);
-    if (secondChunk > 0) {
-        memcpy(buffer + firstChunk, queue->data, secondChunk);
-    }
-    queue->head = (queue->head + readSize) % MAX_DATA_SIZE;
-    queue->size -= readSize;
-
-    return readSize;
-}
-
-void producer(const char* filename) {
-    int shm_fd = shm_open(SHARED_MEMORY_NAME, O_CREAT | O_RDWR, 0666);
-    if (shm_fd == -1) {
-        perror("shm_open");
-        exit(1);
+    std::ifstream infile(input_file, std::ios::binary);
+    if (!infile.is_open()) {
+        perror("ifstream");
+        exit(EXIT_FAILURE);
     }
 
-    ftruncate(shm_fd, sizeof(CircularQueue));
-    CircularQueue* queue = (CircularQueue*)mmap(0, sizeof(CircularQueue), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-    if (queue == MAP_FAILED) {
-        perror("mmap");
-        exit(1);
-    }
-
-    if (queue->size == 0 && queue->head == 0 && queue->tail == 0) {
-        initQueue(queue);
-    }
-
-    std::ifstream inputFile(filename, std::ios::in | std::ios::binary);
-    if (!inputFile.is_open()) {
-        std::cerr << "Error opening file" << std::endl;
-        exit(1);
-    }
-
-    char buffer[QUEUE_SIZE];
-    while (inputFile) {
-        inputFile.read(buffer, QUEUE_SIZE);
-        std::streamsize bytesRead = inputFile.gcount();
-        while (bytesRead > 0) {
-            int chunkSize = (bytesRead < QUEUE_SIZE) ? bytesRead : QUEUE_SIZE;
-            enqueue(queue, buffer, chunkSize);
-            bytesRead -= chunkSize;
+    char ch;
+    while (infile.get(ch)) {
+        while (isFull(queue)) {
+            // Busy wait or use semaphore
         }
+        enqueue(queue, ch);
     }
 
-    inputFile.close();
-    munmap(queue, sizeof(CircularQueue));
+    infile.close();
+    munmap(queue, SHM_SIZE);
     close(shm_fd);
 }
 
-void consumer(const char* outputFilename) {
-    int shm_fd = shm_open(SHARED_MEMORY_NAME, O_RDWR, 0666);
+void consumer(const char* output_file) {
+    int shm_fd = shm_open(SHM_NAME, O_RDONLY, 0666);
     if (shm_fd == -1) {
         perror("shm_open");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
 
-    CircularQueue* queue = (CircularQueue*)mmap(0, sizeof(CircularQueue), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    CircularQueue* queue = (CircularQueue*) mmap(0, SHM_SIZE, PROT_READ, MAP_SHARED, shm_fd, 0);
     if (queue == MAP_FAILED) {
         perror("mmap");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
 
-    std::ofstream outputFile(outputFilename, std::ios::out | std::ios::binary);
-    if (!outputFile.is_open()) {
-        std::cerr << "Error opening file" << std::endl;
-        exit(1);
+    std::ofstream outfile(output_file, std::ios::binary);
+    if (!outfile.is_open()) {
+        perror("ofstream");
+        exit(EXIT_FAILURE);
     }
 
-    char buffer[QUEUE_SIZE];
     while (true) {
-        int bytesRead = dequeue(queue, buffer, QUEUE_SIZE);
-        if (bytesRead > 0) {
-            outputFile.write(buffer, bytesRead);
-        } else if (isQueueEmpty(queue)) {
-            break;
+        while (isEmpty(queue)) {
+            // Busy wait or use semaphore
         }
+        char ch = dequeue(queue);
+        outfile.put(ch);
+        if (queue->head == queue->tail) break;
     }
 
-    outputFile.close();
-    munmap(queue, sizeof(CircularQueue));
+    outfile.close();
+    munmap(queue, SHM_SIZE);
     close(shm_fd);
+    shm_unlink(SHM_NAME);
 }
 
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <producer|consumer> <filename>" << std::endl;
+    if (argc != 4) {
+        std::cerr << "Usage: " << argv[0] << " <producer|consumer> <input_file> <output_file>" << std::endl;
         return 1;
     }
 
-    if (strcmp(argv[1], "producer") == 0) {
-        producer(argv[2]);
-    } else if (strcmp(argv[1], "consumer") == 0) {
-        consumer(argv[2]);
+    std::string role = argv[1];
+    const char* input_file = argv[2];
+    const char* output_file = argv[3];
+
+    if (role == "producer") {
+        producer(input_file);
+    } else if (role == "consumer") {
+        consumer(output_file);
     } else {
-        std::cerr << "Invalid argument: " << argv[1] << std::endl;
+        std::cerr << "Unknown role: " << role << std::endl;
         return 1;
     }
 
