@@ -1,0 +1,167 @@
+#include <iostream>
+#include <fstream>
+#include <cstring>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <semaphore.h>
+
+#define SHARED_MEMORY_NAME "/shared_memory"
+#define QUEUE_SIZE 1024  // Adjust this size as needed
+#define MAX_DATA_SIZE 1024 * 1024 * 10  // 10 MB
+
+struct CircularQueue {
+    char data[MAX_DATA_SIZE];
+    int head;
+    int tail;
+    int size;
+};
+
+void initQueue(CircularQueue* queue) {
+    queue->head = 0;
+    queue->tail = 0;
+    queue->size = 0;
+}
+
+bool isQueueFull(CircularQueue* queue) {
+    return queue->size == MAX_DATA_SIZE;
+}
+
+bool isQueueEmpty(CircularQueue* queue) {
+    return queue->size == 0;
+}
+
+void enqueue(CircularQueue* queue, const char* buffer, int size) {
+    if (isQueueFull(queue)) {
+        std::cerr << "Queue is full" << std::endl;
+        return;
+    }
+
+    int spaceLeft = MAX_DATA_SIZE - queue->size;
+    int writeSize = (size < spaceLeft) ? size : spaceLeft;
+    int firstChunk = (queue->tail + writeSize <= MAX_DATA_SIZE) ? writeSize : MAX_DATA_SIZE - queue->tail;
+    int secondChunk = writeSize - firstChunk;
+
+    memcpy(queue->data + queue->tail, buffer, firstChunk);
+    memcpy(queue->data, buffer + firstChunk, secondChunk);
+    queue->tail = (queue->tail + writeSize) % MAX_DATA_SIZE;
+    queue->size += writeSize;
+}
+
+int dequeue(CircularQueue* queue, char* buffer, int size) {
+    if (isQueueEmpty(queue)) {
+        std::cerr << "Queue is empty" << std::endl;
+        return 0;
+    }
+
+    int availableData = queue->size;
+    int readSize = (size < availableData) ? size : availableData;
+    int firstChunk = (queue->head + readSize <= MAX_DATA_SIZE) ? readSize : MAX_DATA_SIZE - queue->head;
+    int secondChunk = readSize - firstChunk;
+
+    memcpy(buffer, queue->data + queue->head, firstChunk);
+    memcpy(buffer + firstChunk, queue->data, secondChunk);
+    queue->head = (queue->head + readSize) % MAX_DATA_SIZE;
+    queue->size -= readSize;
+
+    return readSize;
+}
+
+void producer(const char* filename) {
+    // Create or open shared memory
+    int shm_fd = shm_open(SHARED_MEMORY_NAME, O_CREAT | O_RDWR, 0666);
+    if (shm_fd == -1) {
+        perror("shm_open");
+        exit(1);
+    }
+
+    // Configure the size of the shared memory
+    ftruncate(shm_fd, sizeof(CircularQueue));
+
+    // Map the shared memory
+    CircularQueue* queue = (CircularQueue*)mmap(0, sizeof(CircularQueue), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (queue == MAP_FAILED) {
+        perror("mmap");
+        exit(1);
+    }
+
+    // Initialize the queue if needed
+    if (queue->size == 0 && queue->head == 0 && queue->tail == 0) {
+        initQueue(queue);
+    }
+
+    // Open the input file
+    std::ifstream inputFile(filename, std::ios::in | std::ios::binary);
+    if (!inputFile.is_open()) {
+        std::cerr << "Error opening file" << std::endl;
+        exit(1);
+    }
+
+    // Read file data and enqueue
+    char buffer[QUEUE_SIZE];
+    while (inputFile) {
+        inputFile.read(buffer, QUEUE_SIZE);
+        std::streamsize bytesRead = inputFile.gcount();
+        enqueue(queue, buffer, bytesRead);
+    }
+
+    inputFile.close();
+
+    // Unmap and close shared memory
+    munmap(queue, sizeof(CircularQueue));
+    close(shm_fd);
+}
+
+void consumer(const char* outputFilename) {
+    // Open shared memory
+    int shm_fd = shm_open(SHARED_MEMORY_NAME, O_RDWR, 0666);
+    if (shm_fd == -1) {
+        perror("shm_open");
+        exit(1);
+    }
+
+    // Map the shared memory
+    CircularQueue* queue = (CircularQueue*)mmap(0, sizeof(CircularQueue), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (queue == MAP_FAILED) {
+        perror("mmap");
+        exit(1);
+    }
+
+    // Open the output file
+    std::ofstream outputFile(outputFilename, std::ios::out | std::ios::binary);
+    if (!outputFile.is_open()) {
+        std::cerr << "Error opening file" << std::endl;
+        exit(1);
+    }
+
+    // Read from queue and write to file
+    char buffer[QUEUE_SIZE];
+    while (!isQueueEmpty(queue)) {
+        int bytesRead = dequeue(queue, buffer, QUEUE_SIZE);
+        outputFile.write(buffer, bytesRead);
+    }
+
+    outputFile.close();
+
+    // Unmap and close shared memory
+    munmap(queue, sizeof(CircularQueue));
+    close(shm_fd);
+}
+
+int main(int argc, char* argv[]) {
+    if (argc != 3) {
+        std::cerr << "Usage: " << argv[0] << " <producer|consumer> <inputfile|outputfile>" << std::endl;
+        return 1;
+    }
+
+    if (strcmp(argv[1], "producer") == 0) {
+        producer(argv[2]);
+    } else if (strcmp(argv[1], "consumer") == 0) {
+        consumer(argv[2]);
+    } else {
+        std::cerr << "Invalid argument: " << argv[1] << std::endl;
+        return 1;
+    }
+
+    return 0;
+}
