@@ -71,8 +71,9 @@ void producer(const char* file_name, void* shm_ptr, size_t file_size) {
 // Circular queue class for managing data chunks while going from shared memo to output file
 class CircularQueue {
 public:
+//start_(0)-> this method is called while this->start=0 is called assignment of data members
     CircularQueue(size_t size) : size_(size), start_(0), end_(0), count_(0) {
-        data_.resize(size);
+        data_.resize(size);//gives the specific size to the data vector
     }
 
     void push(char value) {
