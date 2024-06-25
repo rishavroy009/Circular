@@ -1,90 +1,169 @@
 #include <iostream>
 #include <fstream>
-#include <fcntl.h>
-#include <sys/shm.h>
-#include <sys/stat.h>
+#include <cstring>
 #include <sys/mman.h>
+#include <fcntl.h>
 #include <unistd.h>
-#include <thread>
-#include <semaphore.h>
 
-#define SHM_SIZE 10485760 // 10 MB
+#define SHARED_MEMORY_NAME "/shared_memory"
+#define BUFFER_SIZE 1024  // Buffer size for reading and writing
+#define MAX_DATA_SIZE 1024 * 1024 * 10  // 10 MB
 
-struct shared_data {
-  char data[SHM_SIZE]; // Shared memory segment to hold data chunks
-  int prod_idx;        // Index for producer to add data
-  int cons_idx;        // Index for consumer to read data
-  bool full;           // Flag to indicate if queue is full
-  bool empty;          // Flag to indicate if queue is empty
-  sem_t mutex;         // Semaphore for mutual exclusion
-  sem_t empty_sem;     // Semaphore for empty slot
-  sem_t full_sem;      // Semaphore for full slot
+struct CircularQueue {
+    char data[MAX_DATA_SIZE];
+    int head;
+    int tail;
+    int size;
+    bool producer_done; // Flag to indicate producer is done
 };
 
-void producer(const char* filename, shared_data* shm_ptr) {
-  std::ifstream infile(filename, std::ios::binary);
-  int bytes_read;
-  char buffer[4096]; // Buffer to read data in chunks
-
-  // Initialize semaphores (full initialized to 1, empty to 0)
-  sem_init(&(shm_ptr->mutex), 0, 1);
-  sem_init(&(shm_ptr->empty_sem), 0, 0);
-  sem_init(&(shm_ptr->full_sem), 0, 1);
-
-  while ((bytes_read = infile.read(buffer, sizeof(buffer)).gcount()) > 0) {
-    // Wait for empty slot
-    sem_wait(&(shm_ptr->empty_sem));
-
-    // Lock shared memory for mutual exclusion
-    sem_wait(&(shm_ptr->mutex));
-
-    // Copy data to shared memory
-    memcpy(shm_ptr->data + shm_ptr->prod_idx, buffer, bytes_read);
-    shm_ptr->prod_idx = (shm_ptr->prod_idx + bytes_read) % SHM_SIZE;
-
-    // Update flags
-    shm_ptr->empty = false;
-    shm_ptr->full = (shm_ptr->prod_idx == shm_ptr->cons_idx);
-
-    // Unlock shared memory
-    sem_post(&(shm_ptr->mutex));
-
-    // Signal full slot
-    sem_post(&(shm_ptr->full_sem));
-  }
-
-  infile.close();
-  sem_close(&(shm_ptr->mutex));
-  sem_close(&(shm_ptr->empty_sem));
-  sem_close(&(shm_ptr->full_sem));
+void initQueue(CircularQueue* queue) {
+    queue->head = 0;
+    queue->tail = 0;
+    queue->size = 0;
+    queue->producer_done = false;
 }
 
-void consumer(const char* outfile, shared_data* shm_ptr) {
-  std::ofstream outfile_stream(outfile, std::ios::binary);
-  int bytes_written = 0;
-  char buffer[4096];
+bool isQueueFull(CircularQueue* queue) {
+    return queue->size == MAX_DATA_SIZE;
+}
 
-  // Initialize semaphores (full initialized to 1, empty to 0)
-  sem_init(&(shm_ptr->mutex), 0, 1);
-  sem_init(&(shm_ptr->empty_sem), 0, 0);
-  sem_init(&(shm_ptr->full_sem), 0, 1);
+bool isQueueEmpty(CircularQueue* queue) {
+    return queue->size == 0;
+}
 
-  while (true) {
-    // Wait for full slot
-    sem_wait(&(shm_ptr->full_sem));
+void enqueue(CircularQueue* queue, const char* buffer, int size) {
+    if (isQueueFull(queue)) {
+        return;
+    }
 
-    // Lock shared memory for mutual exclusion
-    sem_wait(&(shm_ptr->mutex));
+    int space_left = MAX_DATA_SIZE - queue->size;
+    int write_size = (size < space_left) ? size : space_left;
 
-    // Copy data from shared memory
-    int bytes_to_copy = (SHM_SIZE - shm_ptr->cons_idx < SHM_SIZE - shm_ptr->prod_idx) ?
-                        SHM_SIZE - shm_ptr->cons_idx : SHM_SIZE - shm_ptr->prod_idx;
-    bytes_to_copy = std::min(bytes_to_copy, sizeof(buffer));
-    memcpy(buffer, shm_ptr->data + shm_ptr->cons_idx, bytes_to_copy);
-    outfile_stream.write(buffer, bytes_to_copy);
-    bytes_written += bytes_to_copy;
-    shm_ptr->cons_idx = (shm_ptr->cons_idx + bytes_to_copy) % SHM_SIZE;
+    int first_chunk_size = (queue->tail + write_size <= MAX_DATA_SIZE) ? write_size : MAX_DATA_SIZE - queue->tail;
+    int second_chunk_size = write_size - first_chunk_size;
 
-    // Update flags
-    shm_ptr->full = false;
-    shm_ptr->empty = (shm_ptr->cons_idx == shm_
+    memcpy(queue->data + queue->tail, buffer, first_chunk_size);
+    memcpy(queue->data, buffer + first_chunk_size, second_chunk_size);
+
+    queue->tail = (queue->tail + write_size) % MAX_DATA_SIZE;
+    queue->size += write_size;
+}
+
+int dequeue(CircularQueue* queue, char* buffer, int size) {
+    if (isQueueEmpty(queue)) {
+        return 0;
+    }
+
+    int read_size = (size < queue->size) ? size : queue->size;
+
+    int first_chunk_size = (queue->head + read_size <= MAX_DATA_SIZE) ? read_size : MAX_DATA_SIZE - queue->head;
+    int second_chunk_size = read_size - first_chunk_size;
+
+    memcpy(buffer, queue->data + queue->head, first_chunk_size);
+    memcpy(buffer + first_chunk_size, queue->data, second_chunk_size);
+
+    queue->head = (queue->head + read_size) % MAX_DATA_SIZE;
+    queue->size -= read_size;
+
+    return read_size;
+}
+
+void producer(const char* filename) {
+    int shm_fd = shm_open(SHARED_MEMORY_NAME, O_CREAT | O_RDWR, 0666);
+    if (shm_fd == -1) {
+        perror("shm_open");
+        exit(1);
+    }
+
+    ftruncate(shm_fd, sizeof(CircularQueue));
+
+    CircularQueue* queue = (CircularQueue*)mmap(0, sizeof(CircularQueue), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (queue == MAP_FAILED) {
+        perror("mmap");
+        exit(1);
+    }
+
+    if (queue->size == 0 && queue->head == 0 && queue->tail == 0) {
+        initQueue(queue);
+    }
+
+    std::ifstream inputFile(filename, std::ios::in | std::ios::binary);
+    if (!inputFile.is_open()) {
+        std::cerr << "Error opening file" << std::endl;
+        exit(1);
+    }
+
+    char buffer[BUFFER_SIZE];
+    while (inputFile.read(buffer, BUFFER_SIZE)) {
+        std::streamsize bytesRead = inputFile.gcount();
+        while (bytesRead > 0) {
+            if (!isQueueFull(queue)) {
+                int chunkSize = (bytesRead < BUFFER_SIZE) ? bytesRead : BUFFER_SIZE;
+                enqueue(queue, buffer, chunkSize);
+                bytesRead -= chunkSize;
+            }
+        }
+    }
+
+    // Final read to ensure all remaining data is enqueued
+    if (inputFile.gcount() > 0) {
+        enqueue(queue, buffer, inputFile.gcount());
+    }
+
+    queue->producer_done = true;  // Indicate producer is done
+    inputFile.close();
+    munmap(queue, sizeof(CircularQueue));
+    close(shm_fd);
+}
+
+void consumer(const char* outputFilename) {
+    int shm_fd = shm_open(SHARED_MEMORY_NAME, O_RDWR, 0666);
+    if (shm_fd == -1) {
+        perror("shm_open");
+        exit(1);
+    }
+
+    CircularQueue* queue = (CircularQueue*)mmap(0, sizeof(CircularQueue), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (queue == MAP_FAILED) {
+        perror("mmap");
+        exit(1);
+    }
+
+    std::ofstream outputFile(outputFilename, std::ios::out | std::ios::binary);
+    if (!outputFile.is_open()) {
+        std::cerr << "Error opening file" << std::endl;
+        exit(1);
+    }
+
+    char buffer[BUFFER_SIZE];
+    while (!queue->producer_done || !isQueueEmpty(queue)) {
+        int bytesRead = dequeue(queue, buffer, BUFFER_SIZE);
+        if (bytesRead > 0) {
+            outputFile.write(buffer, bytesRead);
+        }
+    }
+
+    outputFile.close();
+    munmap(queue, sizeof(CircularQueue));
+    close(shm_fd);
+    shm_unlink(SHARED_MEMORY_NAME);  // Clean up shared memory
+}
+
+int main(int argc, char* argv[]) {
+    if (argc != 3) {
+        std::cerr << "Usage: " << argv[0] << " <producer|consumer> <filename>" << std::endl;
+        return 1;
+    }
+
+    if (strcmp(argv[1], "producer") == 0) {
+        producer(argv[2]);
+    } else if (strcmp(argv[1], "consumer") == 0) {
+        consumer(argv[2]);
+    } else {
+        std::cerr << "Invalid argument: " << argv[1] << std::endl;
+        return 1;
+    }
+
+    return 0;
+}
