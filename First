@@ -9,14 +9,16 @@
 #define BUFFER_SIZE 1024  // Buffer size for reading and writing
 #define MAX_DATA_SIZE 1024 * 1024 * 10  // 10 MB
 
+// Structure defining a circular queue in shared memory
 struct CircularQueue {
-    char data[MAX_DATA_SIZE];
-    int head;
-    int tail;
-    int size;
-    bool producer_done; // Flag to indicate producer is done
+    char data[MAX_DATA_SIZE];  // Array to hold data
+    int head;  // Index of the head of the queue
+    int tail;  // Index of the tail of the queue
+    int size;  // Current size of the queue
+    bool producer_done; // Flag to indicate if producer has finished
 };
 
+// Initialize the circular queue
 void initQueue(CircularQueue* queue) {
     queue->head = 0;
     queue->tail = 0;
@@ -24,77 +26,96 @@ void initQueue(CircularQueue* queue) {
     queue->producer_done = false;
 }
 
+// Check if the queue is full
 bool isQueueFull(CircularQueue* queue) {
     return queue->size == MAX_DATA_SIZE;
 }
 
+// Check if the queue is empty
 bool isQueueEmpty(CircularQueue* queue) {
     return queue->size == 0;
 }
 
+// Enqueue data into the circular queue
 void enqueue(CircularQueue* queue, const char* buffer, int size) {
     if (isQueueFull(queue)) {
-        return;
+        return;  // Cannot enqueue if the queue is full
     }
 
+    // Determine space left in the queue
     int space_left = MAX_DATA_SIZE - queue->size;
     int write_size = (size < space_left) ? size : space_left;
 
+    // Calculate sizes for two chunks of data (if split across end of array)
     int first_chunk_size = (queue->tail + write_size <= MAX_DATA_SIZE) ? write_size : MAX_DATA_SIZE - queue->tail;
     int second_chunk_size = write_size - first_chunk_size;
 
+    // Copy data into the circular buffer
     memcpy(queue->data + queue->tail, buffer, first_chunk_size);
     memcpy(queue->data, buffer + first_chunk_size, second_chunk_size);
 
+    // Update tail pointer and size of the queue
     queue->tail = (queue->tail + write_size) % MAX_DATA_SIZE;
     queue->size += write_size;
 }
 
+// Dequeue data from the circular queue
 int dequeue(CircularQueue* queue, char* buffer, int size) {
     if (isQueueEmpty(queue)) {
-        return 0;
+        return 0;  // Cannot dequeue if the queue is empty
     }
 
+    // Determine how much data to read
     int read_size = (size < queue->size) ? size : queue->size;
 
+    // Calculate sizes for two chunks of data (if split across end of array)
     int first_chunk_size = (queue->head + read_size <= MAX_DATA_SIZE) ? read_size : MAX_DATA_SIZE - queue->head;
     int second_chunk_size = read_size - first_chunk_size;
 
+    // Copy data from the circular buffer to output buffer
     memcpy(buffer, queue->data + queue->head, first_chunk_size);
     memcpy(buffer + first_chunk_size, queue->data, second_chunk_size);
 
+    // Update head pointer and size of the queue
     queue->head = (queue->head + read_size) % MAX_DATA_SIZE;
     queue->size -= read_size;
 
-    return read_size;
+    return read_size;  // Return the number of bytes read
 }
 
+// Producer function: reads data from a file and writes it to the shared circular queue in shared memory
 void producer(const char* filename) {
+    // Create or open shared memory
     int shm_fd = shm_open(SHARED_MEMORY_NAME, O_CREAT | O_RDWR, 0666);
     if (shm_fd == -1) {
-        perror("shm_open");
+        perror("shm_open");  // Print error if failed
         exit(1);
     }
 
+    // Set the size of shared memory to hold CircularQueue structure
     ftruncate(shm_fd, sizeof(CircularQueue));
 
+    // Map shared memory to CircularQueue structure
     CircularQueue* queue = (CircularQueue*)mmap(0, sizeof(CircularQueue), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
     if (queue == MAP_FAILED) {
-        perror("mmap");
+        perror("mmap");  // Print error if mapping failed
         exit(1);
     }
 
+    // Initialize queue if it's newly created
     if (queue->size == 0 && queue->head == 0 && queue->tail == 0) {
         initQueue(queue);
     }
 
+    // Open input file for reading binary data
     std::ifstream inputFile(filename, std::ios::in | std::ios::binary);
     if (!inputFile.is_open()) {
-        std::cerr << "Error opening file" << std::endl;
+        std::cerr << "Error opening file" << std::endl;  // Print error if failed to open file
         exit(1);
     }
 
     char buffer[BUFFER_SIZE];
+    // Read data from file in chunks and enqueue into shared circular queue
     while (inputFile.read(buffer, BUFFER_SIZE)) {
         std::streamsize bytesRead = inputFile.gcount();
         while (bytesRead > 0) {
@@ -106,37 +127,42 @@ void producer(const char* filename) {
         }
     }
 
-    // Final read to ensure all remaining data is enqueued
+    // Final read to enqueue any remaining data
     if (inputFile.gcount() > 0) {
         enqueue(queue, buffer, inputFile.gcount());
     }
 
-    queue->producer_done = true;  // Indicate producer is done
-    inputFile.close();
-    munmap(queue, sizeof(CircularQueue));
-    close(shm_fd);
+    queue->producer_done = true;  // Indicate producer has finished
+    inputFile.close();  // Close input file
+    munmap(queue, sizeof(CircularQueue));  // Unmap shared memory
+    close(shm_fd);  // Close shared memory file descriptor
 }
 
+// Consumer function: reads data from shared circular queue in shared memory and writes it to an output file
 void consumer(const char* outputFilename) {
+    // Open shared memory
     int shm_fd = shm_open(SHARED_MEMORY_NAME, O_RDWR, 0666);
     if (shm_fd == -1) {
-        perror("shm_open");
+        perror("shm_open");  // Print error if failed to open shared memory
         exit(1);
     }
 
+    // Map shared memory to CircularQueue structure
     CircularQueue* queue = (CircularQueue*)mmap(0, sizeof(CircularQueue), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
     if (queue == MAP_FAILED) {
-        perror("mmap");
+        perror("mmap");  // Print error if mapping failed
         exit(1);
     }
 
+    // Open output file for writing binary data
     std::ofstream outputFile(outputFilename, std::ios::out | std::ios::binary);
     if (!outputFile.is_open()) {
-        std::cerr << "Error opening file" << std::endl;
+        std::cerr << "Error opening file" << std::endl;  // Print error if failed to open file
         exit(1);
     }
 
     char buffer[BUFFER_SIZE];
+    // Read data from shared circular queue and write to output file
     while (!queue->producer_done || !isQueueEmpty(queue)) {
         int bytesRead = dequeue(queue, buffer, BUFFER_SIZE);
         if (bytesRead > 0) {
@@ -144,26 +170,29 @@ void consumer(const char* outputFilename) {
         }
     }
 
-    outputFile.close();
-    munmap(queue, sizeof(CircularQueue));
-    close(shm_fd);
+    outputFile.close();  // Close output file
+    munmap(queue, sizeof(CircularQueue));  // Unmap shared memory
+    close(shm_fd);  // Close shared memory file descriptor
     shm_unlink(SHARED_MEMORY_NAME);  // Clean up shared memory
 }
 
+// Main function: entry point of the program
 int main(int argc, char* argv[]) {
+    // Check command line arguments
     if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <producer|consumer> <filename>" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <producer|consumer> <filename>" << std::endl;  // Print usage if arguments are incorrect
         return 1;
     }
 
+    // Execute producer or consumer based on command line arguments
     if (strcmp(argv[1], "producer") == 0) {
         producer(argv[2]);
     } else if (strcmp(argv[1], "consumer") == 0) {
         consumer(argv[2]);
     } else {
-        std::cerr << "Invalid argument: " << argv[1] << std::endl;
+        std::cerr << "Invalid argument: " << argv[1] << std::endl;  // Print error if invalid argument provided
         return 1;
     }
 
-    return 0;
+    return 0;  // Exit program successfully
 }
