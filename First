@@ -1,198 +1,183 @@
 #include <iostream>
-#include <fstream>
-#include <cstring>
-#include <sys/mman.h>
-#include <fcntl.h>
-#include <unistd.h>
+#include <fstream>//for file ops
+#include <sys/mman.h>//for memory mapping
+#include <fcntl.h>//file control ops
+#include <unistd.h>// for unix commands like close and ftruncate
+#include <vector>
+#include <algorithm> // including this for std::min function
+using namespace std;
+#define SHM_SIZE 11 * 1024 * 1024 // 11 MB
+#define CHUNK_SIZE 1024 * 1024    // 1 MB chunk size for processing
 
-#define SHARED_MEMORY_NAME "/shared_memory"
-#define BUFFER_SIZE 1024  // Buffer size for reading and writing
-#define MAX_DATA_SIZE 1024 * 1024 * 10  // 10 MB
 
-// Structure defining a circular queue in shared memory
-struct CircularQueue {
-    char data[MAX_DATA_SIZE];  // Array to hold data
-    int head;  // Index of the head of the queue
-    int tail;  // Index of the tail of the queue
-    int size;  // Current size of the queue
-    bool producer_done; // Flag to indicate if producer has finished
+//function for creating shared memory
+//passing a pointer by reference to the function (create_shared_memory) so that the function can modify the original pointer and assign it to the address of the shared memory region created via mmap.
+int create_shared_memory(const char* name, size_t size, void** shm_ptr) {
+    // creating a new shared memory object
+    int shm_fd = shm_open(name, O_CREAT | O_RDWR, 0666);//in read write mode for all
+    if (shm_fd == -1) {
+        cout<<"shm_open error"<<endl;
+        return -1;
+    }
+    //setting the size of the shared memory object
+    if (ftruncate(shm_fd, size) == -1) {
+        cout<<"ftruncate"<<endl;
+        return -1;
+    }
+    //mapping the shared memoryobject into the running process's address space
+    *shm_ptr = mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (*shm_ptr == MAP_FAILED) {
+        cout<<"mmap error "<<endl;
+        return -1;
+    }
+    // mmap() links the file in a special way to the virtual memory management in your system. And this file will be needed as long as you use the address range to which it was allocated.
+    //The function munmap() removes any mappings for those entire pages containing any part of the address space of the process starting at addr and continuing for len bytes.
+    return shm_fd;
+    /*
+    addr:
+
+0:kernel chooses the address for the mapping.
+length:
+
+size: The size of the shared memory region, which is here SHM_SIZE (11 MB).
+prot:
+
+PROT_READ | PROT_WRITE: The memory region can be read and written.
+flags:
+
+MAP_SHARED: changes made to the memory region are visible to other processes that map this shared memory object.
+fd:
+
+shm_fd: file descriptor for the shared memory object, obtained from shm_open.
+offset:
+
+0: wil start mapping at the beginning of the shared memory object.
+    */
+}
+
+//producer function to read data from file and push to shared memory
+void producer(const char* file_name, void* shm_ptr, size_t file_size) {
+    ifstream file(file_name, ios::in | ios::binary);
+    if (!file) {
+        cout << "Unable to open file " << file_name << endl;
+        return;
+    }
+    
+    // readsthe  file content and write to shared memory
+    file.read(static_cast<char*>(shm_ptr), file_size);//will start reading from the shm_ptr
+    file.close();
+}
+
+// Circular queue class for managing data chunks while going from shared memo to output file
+class CircularQueue {
+public:
+    CircularQueue(size_t size) : size_(size), start_(0), end_(0), count_(0) {
+        data_.resize(size);
+    }
+
+    void push(char value) {
+        data_[end_] = value;
+        end_ = (end_ + 1)%size_;//since circular so if index goes beyond end ,then again will start from start
+        if (count_ < size_) {
+            ++count_;
+        } else {
+            start_ = (start_ + 1) % size_;
+        }
+    }
+
+    bool empty() const {
+        return count_ == 0;
+    }
+
+    char front() const {
+        return data_[start_];
+    }
+
+    void pop() {
+        if (!empty()) {
+            start_ = (start_ + 1) % size_;//same logic as for push since circular
+            --count_;
+        }
+    }
+
+private:
+    vector<char> data_;//for the data
+    size_t size_;//max size of the queue
+    size_t start_;//head index
+    size_t end_;//tail index
+    size_t count_;//number of ele in the queue
 };
 
-// Initialize the circular queue
-void initQueue(CircularQueue* queue) {
-    queue->head = 0;
-    queue->tail = 0;
-    queue->size = 0;
-    queue->producer_done = false;
+//consumer function to read data from shared memory and write to an output file
+void consumer(void* shm_ptr, size_t file_size) {
+    CircularQueue circular_queue(CHUNK_SIZE);
+//circular_queue obj
+    //reads data from shared memory in chunks and push to circular queue
+    char* data_ptr = static_cast<char*>(shm_ptr);//typecasting pointer like from void to char or <T> type
+    //here char is specified ,so shm_ptr i.e. void will be typecasted to char type
+    size_t bytes_written = 0;
+
+    ofstream output_file("output_file.mp4", ios::out | ios::binary);
+    if (!output_file) {
+        cout << "Unable to open output file" << endl;
+        return;
+    }
+
+    while (bytes_written < file_size) {
+        int p=CHUNK_SIZE;
+        int k=file_size-bytes_written;
+        size_t chunk_size = min(p,k);//minimum of left data and one chunk will be tranferred
+        for (size_t i = 0; i < chunk_size; ++i) {
+            circular_queue.push(data_ptr[bytes_written + i]);
+        }//firstly, circular queue will temporarily store the data
+        while (!circular_queue.empty()) {
+            output_file.put(circular_queue.front());
+            circular_queue.pop();
+        }//now from the circular queue ,the data will be written to the output file
+        bytes_written += chunk_size;//updating the totral written data
+    }
+
+    output_file.close();
 }
 
-// Check if the queue is full
-bool isQueueFull(CircularQueue* queue) {
-    return queue->size == MAX_DATA_SIZE;
-}
-
-// Check if the queue is empty
-bool isQueueEmpty(CircularQueue* queue) {
-    return queue->size == 0;
-}
-
-// Enqueue data into the circular queue
-void enqueue(CircularQueue* queue, const char* buffer, int size) {
-    if (isQueueFull(queue)) {
-        return;  // Cannot enqueue if the queue is full
-    }
-
-    // Determine space left in the queue
-    int space_left = MAX_DATA_SIZE - queue->size;
-    int write_size = (size < space_left) ? size : space_left;
-
-    // Calculate sizes for two chunks of data (if split across end of array)
-    int first_chunk_size = (queue->tail + write_size <= MAX_DATA_SIZE) ? write_size : MAX_DATA_SIZE - queue->tail;
-    int second_chunk_size = write_size - first_chunk_size;
-
-    // Copy data into the circular buffer
-    memcpy(queue->data + queue->tail, buffer, first_chunk_size);
-    memcpy(queue->data, buffer + first_chunk_size, second_chunk_size);
-
-    // Update tail pointer and size of the queue
-    queue->tail = (queue->tail + write_size) % MAX_DATA_SIZE;
-    queue->size += write_size;
-}
-
-// Dequeue data from the circular queue
-int dequeue(CircularQueue* queue, char* buffer, int size) {
-    if (isQueueEmpty(queue)) {
-        return 0;  // Cannot dequeue if the queue is empty
-    }
-
-    // Determine how much data to read
-    int read_size = (size < queue->size) ? size : queue->size;
-
-    // Calculate sizes for two chunks of data (if split across end of array)
-    int first_chunk_size = (queue->head + read_size <= MAX_DATA_SIZE) ? read_size : MAX_DATA_SIZE - queue->head;
-    int second_chunk_size = read_size - first_chunk_size;
-
-    // Copy data from the circular buffer to output buffer
-    memcpy(buffer, queue->data + queue->head, first_chunk_size);
-    memcpy(buffer + first_chunk_size, queue->data, second_chunk_size);
-
-    // Update head pointer and size of the queue
-    queue->head = (queue->head + read_size) % MAX_DATA_SIZE;
-    queue->size -= read_size;
-
-    return read_size;  // Return the number of bytes read
-}
-
-// Producer function: reads data from a file and writes it to the shared circular queue in shared memory
-void producer(const char* filename) {
-    // Create or open shared memory
-    int shm_fd = shm_open(SHARED_MEMORY_NAME, O_CREAT | O_RDWR, 0666);
-    if (shm_fd == -1) {
-        perror("shm_open");  // Print error if failed
-        exit(1);
-    }
-
-    // Set the size of shared memory to hold CircularQueue structure
-    ftruncate(shm_fd, sizeof(CircularQueue));
-
-    // Map shared memory to CircularQueue structure
-    CircularQueue* queue = (CircularQueue*)mmap(0, sizeof(CircularQueue), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-    if (queue == MAP_FAILED) {
-        perror("mmap");  // Print error if mapping failed
-        exit(1);
-    }
-
-    // Initialize queue if it's newly created
-    if (queue->size == 0 && queue->head == 0 && queue->tail == 0) {
-        initQueue(queue);
-    }
-
-    // Open input file for reading binary data
-    std::ifstream inputFile(filename, std::ios::in | std::ios::binary);
-    if (!inputFile.is_open()) {
-        std::cerr << "Error opening file" << std::endl;  // Print error if failed to open file
-        exit(1);
-    }
-
-    char buffer[BUFFER_SIZE];
-    // Read data from file in chunks and enqueue into shared circular queue
-    while (inputFile.read(buffer, BUFFER_SIZE)) {
-        std::streamsize bytesRead = inputFile.gcount();
-        while (bytesRead > 0) {
-            if (!isQueueFull(queue)) {
-                int chunkSize = (bytesRead < BUFFER_SIZE) ? bytesRead : BUFFER_SIZE;
-                enqueue(queue, buffer, chunkSize);
-                bytesRead -= chunkSize;
-            }
-        }
-    }
-
-    // Final read to enqueue any remaining data
-    if (inputFile.gcount() > 0) {
-        enqueue(queue, buffer, inputFile.gcount());
-    }
-
-    queue->producer_done = true;  // Indicate producer has finished
-    inputFile.close();  // Close input file
-    munmap(queue, sizeof(CircularQueue));  // Unmap shared memory
-    close(shm_fd);  // Close shared memory file descriptor
-}
-
-// Consumer function: reads data from shared circular queue in shared memory and writes it to an output file
-void consumer(const char* outputFilename) {
-    // Open shared memory
-    int shm_fd = shm_open(SHARED_MEMORY_NAME, O_RDWR, 0666);
-    if (shm_fd == -1) {
-        perror("shm_open");  // Print error if failed to open shared memory
-        exit(1);
-    }
-
-    // Map shared memory to CircularQueue structure
-    CircularQueue* queue = (CircularQueue*)mmap(0, sizeof(CircularQueue), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-    if (queue == MAP_FAILED) {
-        perror("mmap");  // Print error if mapping failed
-        exit(1);
-    }
-
-    // Open output file for writing binary data
-    std::ofstream outputFile(outputFilename, std::ios::out | std::ios::binary);
-    if (!outputFile.is_open()) {
-        std::cerr << "Error opening file" << std::endl;  // Print error if failed to open file
-        exit(1);
-    }
-
-    char buffer[BUFFER_SIZE];
-    // Read data from shared circular queue and write to output file
-    while (!queue->producer_done || !isQueueEmpty(queue)) {
-        int bytesRead = dequeue(queue, buffer, BUFFER_SIZE);
-        if (bytesRead > 0) {
-            outputFile.write(buffer, bytesRead);
-        }
-    }
-
-    outputFile.close();  // Close output file
-    munmap(queue, sizeof(CircularQueue));  // Unmap shared memory
-    close(shm_fd);  // Close shared memory file descriptor
-    shm_unlink(SHARED_MEMORY_NAME);  // Clean up shared memory
-}
-
-// Main function: entry point of the program
 int main(int argc, char* argv[]) {
-    // Check command line arguments
-    if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <producer|consumer> <filename>" << std::endl;  // Print usage if arguments are incorrect
+    if (argc != 2) {
+        cout << "less args"<< endl;
         return 1;
     }
 
-    // Execute producer or consumer based on command line arguments
-    if (strcmp(argv[1], "producer") == 0) {
-        producer(argv[2]);
-    } else if (strcmp(argv[1], "consumer") == 0) {
-        consumer(argv[2]);
-    } else {
-        std::cerr << "Invalid argument: " << argv[1] << std::endl;  // Print error if invalid argument provided
+    const char* shm_name = "/shm_example";//shared memo name
+    void* shm_ptr = nullptr;
+    
+    // opens the input file and determine its size
+    ifstream file(argv[1], ios::in | ios::binary | ios::ate);
+    if (!file) {
+        cout << "Unable to open file " << argv[1] << endl;
+        return 1;
+    }
+    size_t file_size = file.tellg();
+    file.close();
+
+    // creating the shared memory
+    int shm_fd = create_shared_memory(shm_name, SHM_SIZE,&shm_ptr);//pointer is sent by reference
+    if (shm_fd == -1) {
         return 1;
     }
 
-    return 0;  // Exit program successfully
+    //calling producer to read from file and write to shared memory(with my file name)
+    producer(argv[1], shm_ptr, file_size);
+
+    //calling consumer to read from shared memory and write to circular queue
+    consumer(shm_ptr, file_size);
+
+    // unmapping the shared memory
+    if (munmap(shm_ptr, SHM_SIZE) == -1) {
+        cout<<"munmap error"<<endl;
+    }
+    //removes the shared memory object
+    if (shm_unlink(shm_name) == -1) {
+        cout<<"shm_unlink"<<endl;
+    }
+
+    return 0;
 }
