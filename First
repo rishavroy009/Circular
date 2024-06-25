@@ -1,118 +1,90 @@
 #include <iostream>
 #include <fstream>
-#include <sys/ipc.h>
+#include <fcntl.h>
 #include <sys/shm.h>
-#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
 #include <unistd.h>
-#include <cstring>
-#include <vector>
+#include <thread>
+#include <semaphore.h>
 
 #define SHM_SIZE 10485760 // 10 MB
-#define CHUNK_SIZE 1024   // 1 KB for each chunk
-#define QUEUE_SIZE (SHM_SIZE / CHUNK_SIZE)
 
-struct CircularQueue {
-    char data[QUEUE_SIZE][CHUNK_SIZE];
-    int head;
-    int tail;
-    int count;
+struct shared_data {
+  char data[SHM_SIZE]; // Shared memory segment to hold data chunks
+  int prod_idx;        // Index for producer to add data
+  int cons_idx;        // Index for consumer to read data
+  bool full;           // Flag to indicate if queue is full
+  bool empty;          // Flag to indicate if queue is empty
+  sem_t mutex;         // Semaphore for mutual exclusion
+  sem_t empty_sem;     // Semaphore for empty slot
+  sem_t full_sem;      // Semaphore for full slot
 };
 
-void producer(const char* input_file, CircularQueue* queue) {
-    std::ifstream infile(input_file, std::ios::binary);
-    if (!infile) {
-        std::cerr << "Error opening input file" << std::endl;
-        return;
-    }
+void producer(const char* filename, shared_data* shm_ptr) {
+  std::ifstream infile(filename, std::ios::binary);
+  int bytes_read;
+  char buffer[4096]; // Buffer to read data in chunks
 
-    while (!infile.eof()) {
-        char buffer[CHUNK_SIZE];
-        infile.read(buffer, CHUNK_SIZE);
-        std::streamsize bytes_read = infile.gcount();
+  // Initialize semaphores (full initialized to 1, empty to 0)
+  sem_init(&(shm_ptr->mutex), 0, 1);
+  sem_init(&(shm_ptr->empty_sem), 0, 0);
+  sem_init(&(shm_ptr->full_sem), 0, 1);
 
-        if (bytes_read > 0) {
-            while (queue->count == QUEUE_SIZE) {
-                // Wait if the queue is full
-                usleep(1000);
-            }
-            memcpy(queue->data[queue->tail], buffer, bytes_read);
-            queue->tail = (queue->tail + 1) % QUEUE_SIZE;
-            queue->count++;
-        }
-    }
+  while ((bytes_read = infile.read(buffer, sizeof(buffer)).gcount()) > 0) {
+    // Wait for empty slot
+    sem_wait(&(shm_ptr->empty_sem));
 
-    infile.close();
+    // Lock shared memory for mutual exclusion
+    sem_wait(&(shm_ptr->mutex));
+
+    // Copy data to shared memory
+    memcpy(shm_ptr->data + shm_ptr->prod_idx, buffer, bytes_read);
+    shm_ptr->prod_idx = (shm_ptr->prod_idx + bytes_read) % SHM_SIZE;
+
+    // Update flags
+    shm_ptr->empty = false;
+    shm_ptr->full = (shm_ptr->prod_idx == shm_ptr->cons_idx);
+
+    // Unlock shared memory
+    sem_post(&(shm_ptr->mutex));
+
+    // Signal full slot
+    sem_post(&(shm_ptr->full_sem));
+  }
+
+  infile.close();
+  sem_close(&(shm_ptr->mutex));
+  sem_close(&(shm_ptr->empty_sem));
+  sem_close(&(shm_ptr->full_sem));
 }
 
-void consumer(const char* output_file, CircularQueue* queue) {
-    std::ofstream outfile(output_file, std::ios::binary);
-    if (!outfile) {
-        std::cerr << "Error opening output file" << std::endl;
-        return;
-    }
+void consumer(const char* outfile, shared_data* shm_ptr) {
+  std::ofstream outfile_stream(outfile, std::ios::binary);
+  int bytes_written = 0;
+  char buffer[4096];
 
-    while (true) {
-        if (queue->count > 0) {
-            outfile.write(queue->data[queue->head], CHUNK_SIZE);
-            queue->head = (queue->head + 1) % QUEUE_SIZE;
-            queue->count--;
+  // Initialize semaphores (full initialized to 1, empty to 0)
+  sem_init(&(shm_ptr->mutex), 0, 1);
+  sem_init(&(shm_ptr->empty_sem), 0, 0);
+  sem_init(&(shm_ptr->full_sem), 0, 1);
 
-            // End condition (specific to this example, adjust as needed)
-            if (queue->count == 0 && queue->head == queue->tail) {
-                break;
-            }
-        } else {
-            // Wait if the queue is empty
-            usleep(1000);
-        }
-    }
+  while (true) {
+    // Wait for full slot
+    sem_wait(&(shm_ptr->full_sem));
 
-    outfile.close();
-}
+    // Lock shared memory for mutual exclusion
+    sem_wait(&(shm_ptr->mutex));
 
-int main() {
-    // Create shared memory
-    key_t key = ftok("shmfile",65);
-    int shmid = shmget(key, SHM_SIZE, 0666|IPC_CREAT);
-    if (shmid < 0) {
-        std::cerr << "Failed to create shared memory" << std::endl;
-        return 1;
-    }
+    // Copy data from shared memory
+    int bytes_to_copy = (SHM_SIZE - shm_ptr->cons_idx < SHM_SIZE - shm_ptr->prod_idx) ?
+                        SHM_SIZE - shm_ptr->cons_idx : SHM_SIZE - shm_ptr->prod_idx;
+    bytes_to_copy = std::min(bytes_to_copy, sizeof(buffer));
+    memcpy(buffer, shm_ptr->data + shm_ptr->cons_idx, bytes_to_copy);
+    outfile_stream.write(buffer, bytes_to_copy);
+    bytes_written += bytes_to_copy;
+    shm_ptr->cons_idx = (shm_ptr->cons_idx + bytes_to_copy) % SHM_SIZE;
 
-    // Attach to the shared memory
-    CircularQueue* queue = static_cast<CircularQueue*>(shmat(shmid, (void*)0, 0));
-    if (queue == (void*)-1) {
-        std::cerr << "Failed to attach shared memory" << std::endl;
-        return 1;
-    }
-
-    // Initialize the queue
-    queue->head = 0;
-    queue->tail = 0;
-    queue->count = 0;
-
-    // Fork a process for producer and consumer
-    pid_t pid = fork();
-    if (pid < 0) {
-        std::cerr << "Fork failed" << std::endl;
-        return 1;
-    } else if (pid == 0) {
-        // Child process: producer
-        producer("input.dat", queue);
-        exit(0);
-    } else {
-        // Parent process: consumer
-        consumer("output.dat", queue);
-
-        // Wait for the producer to finish
-        wait(NULL);
-
-        // Detach from shared memory
-        shmdt(queue);
-
-        // Destroy the shared memory
-        shmctl(shmid, IPC_RMID, NULL);
-    }
-
-    return 0;
-}
+    // Update flags
+    shm_ptr->full = false;
+    shm_ptr->empty = (shm_ptr->cons_idx == shm_
